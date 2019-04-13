@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 // url with status
@@ -47,7 +49,7 @@ func main() {
 	for {
 		w := <-connworkers
 		conn, _ := ln.Accept()
-		w.handle(conn)
+		go w.handle(conn)
 	}
 }
 
@@ -66,9 +68,6 @@ func (w *connWorker) handle(c net.Conn) {
 			return
 		}
 		u = strings.TrimSuffix(u, "\n")
-		if _, err := url.Parse(u); err != nil {
-			return
-		}
 
 		check <- u
 	}
@@ -84,20 +83,13 @@ func dispatcher() {
 		go w.start()
 	}
 
-	log.Printf("dispatcher starting")
-
 	for {
-		log.Printf("dispatcher waiting for a job")
 		select {
 		case u := <-check:
-			log.Printf("waiting for check worker: %s", u)
 			w := <-checkworkers // wait for a worker
-			log.Printf("checkworker %d found", w.id)
-			w.c <- u // send them a url to check
+			w.c <- u            // send them a url to check
 		}
 	}
-
-	log.Printf("dispatcher ending")
 }
 
 type checkWorker struct {
@@ -111,15 +103,30 @@ func (c *checkWorker) start() {
 
 		select {
 		case u := <-c.c:
-			status := c.check(u)      // check the url
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+
+			status := c.check(ctx, u) // check the url
 			checked <- uws{u, status} // push to the results channel for writing
+
+			cancel()
 		}
 	}
 }
 
-func (c *checkWorker) check(url string) int {
-	fmt.Printf("checking url %s\n", url)
-	resp, err := http.Head(url)
+func (c *checkWorker) check(ctx context.Context, u string) int {
+	fmt.Printf("[cw %d] checking url %s\n", c.id, u)
+	if _, err := url.Parse(u); err != nil {
+		return -1
+	}
+
+	req, err := http.NewRequest(http.MethodHead, u, nil)
+	if err != nil {
+		return -1
+	}
+
+	req = req.WithContext(ctx)
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return -1
 	}

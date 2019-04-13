@@ -8,7 +8,26 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+)
+
+// url with status
+type uws struct {
+	url    string
+	status int
+}
+
+var (
+	maxConns        = 2
+	maxCheckWorkers = 2
+)
+
+var (
+	connworkers  = make(chan *connWorker, maxConns)
+	checkworkers = make(chan *checkWorker, maxCheckWorkers)
+	check        = make(chan string, 10000)
+	checked      = make(chan uws, 10000)
 )
 
 func main() {
@@ -18,19 +37,28 @@ func main() {
 	}
 	log.Printf("Listening for tcp connections on :8080")
 
-	for {
-		conn, _ := ln.Accept()
+	go writer()
+	go dispatcher()
 
-		go func() {
-			defer conn.Close()
-			urlsFromReader(conn)
-		}()
+	for i := 0; i < maxConns; i++ {
+		connworkers <- &connWorker{}
+	}
+
+	for {
+		w := <-connworkers
+		conn, _ := ln.Accept()
+		w.handle(conn)
 	}
 }
 
-func urlsFromReader(r io.Reader) {
+type connWorker struct{}
+
+func (w *connWorker) handle(c net.Conn) {
+	defer c.Close()
+	defer func() { connworkers <- w }()
+
 	for {
-		u, err := bufio.NewReader(r).ReadString('\n')
+		u, err := bufio.NewReader(c).ReadString('\n')
 		if err == io.EOF {
 			return
 		}
@@ -42,20 +70,76 @@ func urlsFromReader(r io.Reader) {
 			return
 		}
 
-		status, err := check(u)
-		if err != nil {
-			return
-		}
-
-		fmt.Printf("url received: %s, status: %d\n", u, status)
+		check <- u
 	}
 }
 
-func check(url string) (int, error) {
-	resp, err := http.Head(url)
-	if err != nil {
-		return -1, err
+func dispatcher() {
+	// start up the checking workers
+	for i := 0; i < maxCheckWorkers; i++ {
+		w := &checkWorker{
+			id: i,
+			c:  make(chan string),
+		}
+		go w.start()
 	}
 
-	return resp.StatusCode, nil
+	log.Printf("dispatcher starting")
+
+	for {
+		log.Printf("dispatcher waiting for a job")
+		select {
+		case u := <-check:
+			log.Printf("waiting for check worker: %s", u)
+			w := <-checkworkers // wait for a worker
+			log.Printf("checkworker %d found", w.id)
+			w.c <- u // send them a url to check
+		}
+	}
+
+	log.Printf("dispatcher ending")
+}
+
+type checkWorker struct {
+	id int
+	c  chan string
+}
+
+func (c *checkWorker) start() {
+	for {
+		checkworkers <- c // signal that we're ready for work
+
+		select {
+		case u := <-c.c:
+			status := c.check(u)      // check the url
+			checked <- uws{u, status} // push to the results channel for writing
+		}
+	}
+}
+
+func (c *checkWorker) check(url string) int {
+	fmt.Printf("checking url %s\n", url)
+	resp, err := http.Head(url)
+	if err != nil {
+		return -1
+	}
+
+	return resp.StatusCode
+}
+
+func writer() {
+	fo, err := os.Create("urls.txt")
+	if err != nil {
+		log.Fatalf("couldn't open output file for writing: %s", err)
+	}
+	defer fo.Close()
+
+	w := bufio.NewWriter(fo)
+	for {
+		url := <-checked
+		w.WriteString(fmt.Sprintf("%s,%d\n", url.url, url.status))
+
+		// TODO: move flush to be periodic instead of after every string
+		w.Flush()
+	}
 }
